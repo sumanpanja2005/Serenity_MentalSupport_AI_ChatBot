@@ -116,4 +116,6 @@ def chat():
     return jsonify({"response": bot_response})
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # FIX: Bind the application to '0.0.0.0' and the required PORT environment variable
+    port = int(os.environ.get('PORT', 5000)) # Use 5000 as a fallback for local testing
+    app.run(host='0.0.0.0', port=port, debug=False)
