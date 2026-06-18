@@ -21,7 +21,7 @@ warnings.filterwarnings(
 # --- API Key Setup ---
 
 # The API Key is hardcoded here as requested.
-API_KEY = "AQ.Ab8RN6JPlE7hl15e8-5vWpgiIUV61yV2NxLty1iG9zFzuuRVJw" # <-- Your hardcoded key
+API_KEY = "AQ.Ab8RN6JQPoqdc1b1OsvGdBHsgdoIAhzkY5XlGEwNck67eGWvRw" # <-- Your hardcoded key
 
 # Initialize the Gemini client
 try:
