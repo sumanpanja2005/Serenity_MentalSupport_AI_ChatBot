@@ -4,7 +4,7 @@
 Flask>=2.0.0
 
 # The official Google Gemini SDK for Python.
-google-genai
+google-genai>=2.9.0
 
 # Pydantic is a dependency of google-genai and used internally for data validation.
 # Specifying it ensures compatibility, though it is usually handled by the SDK package.

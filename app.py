@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import traceback
 import warnings 
 # FIX: Import genai client directly from google
@@ -20,12 +21,19 @@ warnings.filterwarnings(
 
 # --- API Key Setup ---
 
-# The API Key is hardcoded here as requested.
-API_KEY = "AQ.Ab8RN6JQPoqdc1b1OsvGdBHsgdoIAhzkY5XlGEwNck67eGWvRw" # <-- Your hardcoded key
+API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+
+if not API_KEY:
+    print(
+        "FATAL ERROR: No Gemini API key found.\n"
+        "Create one at https://aistudio.google.com/apikey then set:\n"
+        "  set GEMINI_API_KEY=your_key_here   (Windows)\n"
+        "  export GEMINI_API_KEY=your_key_here (Mac/Linux)"
+    )
+    sys.exit(1)
 
 # Initialize the Gemini client
 try:
-    # FIX: Use genai.Client() from the correct import
     client = genai.Client(api_key=API_KEY)
     print(f"API Key loaded. Client initialized for Gemini. Key prefix: {API_KEY[:4]}...")
 except Exception as e:
@@ -37,7 +45,19 @@ app = Flask(__name__)
 
 # --- Configuration ---
 
-MODEL_NAME = "gemini-2.5-flash" 
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+FALLBACK_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "GEMINI_FALLBACK_MODELS", "gemini-2.0-flash-lite,gemini-2.0-flash"
+    ).split(",")
+    if m.strip()
+]
+MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "20"))
+MAX_RETRIES = 3
+RETRY_BASE_DELAY_SEC = 2
+
+print(f"Primary model: {MODEL_NAME} | Fallbacks: {', '.join(FALLBACK_MODELS) or 'none'}")
 SYSTEM_PROMPT = """You are a Mental Health Companion Chatbot designed to support students.
 Your main destination is to address high levels of stress, anxiety, and loneliness.
 You should provide empathetic, motivational responses and relaxation tips.
@@ -51,6 +71,69 @@ CHAT_HISTORY = []
 
 # --- Core Functions ---
 
+def trim_history():
+    """Keep only the most recent messages to reduce token usage and quota pressure."""
+    global CHAT_HISTORY
+    if len(CHAT_HISTORY) > MAX_HISTORY_MESSAGES:
+        CHAT_HISTORY = CHAT_HISTORY[-MAX_HISTORY_MESSAGES:]
+
+
+def is_zero_quota_error(err: str) -> bool:
+    return (
+        "RESOURCE_EXHAUSTED" in err
+        and "quota_limit_value" in err
+        and ("'0'" in err or '"0"' in err)
+    )
+
+
+def quota_exhausted_message() -> str:
+    return (
+        "The Gemini API quota for your Google Cloud project is currently 0, so requests "
+        "cannot be processed. To fix this:\n"
+        "1. Open https://aistudio.google.com and check your plan/billing status.\n"
+        "2. Create a new API key in a new Google Cloud project if needed.\n"
+        "3. Ensure the Generative Language API is enabled for that project.\n"
+        "4. Wait a few minutes after enabling billing, then restart this app.\n"
+        "5. If quotas still show 0, request an increase at "
+        "https://cloud.google.com/docs/quotas/help/request_increase"
+    )
+
+
+def generate_content_with_retry(models, contents, config):
+    """Try models in order; retry transient 429 rate limits with exponential backoff."""
+    last_error = None
+
+    for model in models:
+        for attempt in range(MAX_RETRIES):
+            try:
+                return client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config,
+                )
+            except APIError as e:
+                last_error = e
+                err = str(e)
+                if e.code != 429:
+                    raise
+
+                if is_zero_quota_error(err):
+                    raise
+
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY_SEC * (2 ** attempt)
+                    print(f"Rate limited on {model}, retrying in {delay}s...")
+                    time.sleep(delay)
+                    continue
+
+                print(f"Rate limited on {model}, trying next fallback model...")
+                break
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("No models configured for Gemini API requests.")
+
+
 def call_api_no_stream(user_input):
     """
     (Flask-Compatible) Sends the user input to the Gemini API and returns the full response text.
@@ -63,18 +146,18 @@ def call_api_no_stream(user_input):
         "parts": [{"text": user_input}] 
     }
     CHAT_HISTORY.append(user_message_content)
+    trim_history()
+
+    models_to_try = [MODEL_NAME] + [
+        m for m in FALLBACK_MODELS if m != MODEL_NAME
+    ]
+    config = genai.types.GenerateContentConfig(
+        temperature=0.7,
+        system_instruction=SYSTEM_PROMPT,
+    )
 
     try:
-        # 2. Call the non-streaming API
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=CHAT_HISTORY,
-            # FIX: Use genai.types.GenerateContentConfig()
-            config=genai.types.GenerateContentConfig(
-                temperature=0.7,
-                system_instruction=SYSTEM_PROMPT 
-            )
-        )
+        response = generate_content_with_retry(models_to_try, CHAT_HISTORY, config)
         
         # 3. Extract the full response text
         full_response_text = response.text
@@ -85,13 +168,25 @@ def call_api_no_stream(user_input):
             "parts": [{"text": full_response_text}]
         }
         CHAT_HISTORY.append(model_response_content)
+        trim_history()
         
         return full_response_text
 
     except APIError as e:
+        CHAT_HISTORY.pop()
         err = str(e)
+        if "ACCESS_TOKEN_TYPE_UNSUPPORTED" in err or "UNAUTHENTICATED" in err:
+            return (
+                "ERROR: Gemini API authentication failed. Your API key may be invalid, "
+                "expired, or revoked. Create a new key at https://aistudio.google.com/apikey "
+                "and set the GEMINI_API_KEY environment variable, then restart the app."
+            )
+        if is_zero_quota_error(err) or (
+            e.code == 429 and "RESOURCE_EXHAUSTED" in err
+        ):
+            return quota_exhausted_message()
         if "API_KEY_INVALID" in err or "permission_denied" in err.lower():
-            return "ERROR: API Key is invalid or not authorized. Check your hardcoded key and ensure billing is enabled."
+            return "ERROR: API Key is invalid or not authorized. Check GEMINI_API_KEY and ensure billing is enabled."
         traceback.print_exc()
         return f"API request failed: {err}"
     except Exception as e:
